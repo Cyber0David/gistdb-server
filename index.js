@@ -1,10 +1,16 @@
+// === В САМОЕ НАЧАЛО ФАЙЛА, ДО import express... ===
+console.log('=== DEBUG STARTUP ===');
+console.log('ENV PORT:', process.env.PORT);
+console.log('NODE_VERSION:', process.version);
+console.log('CWD:', process.cwd());
+console.log('=== END DEBUG ===');
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
-console.log('ENV PORT:', process.env.PORT);
+
 
 const { Pool } = pg;
 const app = express();
