@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
+console.log('ENV PORT:', process.env.PORT);
 
 const { Pool } = pg;
 const app = express();
