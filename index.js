@@ -241,7 +241,7 @@ app.patch('/api/gists/:gistId/name', auth, async (req, res) => {
 // ── START ─────────────────────────────────────────────────────────────────────
 // Start HTTP server immediately so Railway healthcheck passes,
 // then connect to DB in background with retries
-app.listen(PORT, () => console.log(`GistDB server on :${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`GistDB server on :${PORT}`));
 
 initDB().catch(e => {
   console.error('DB init failed after all retries:', e);
