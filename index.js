@@ -3,6 +3,7 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
 
 const { Pool } = pg;
 const app = express();
@@ -11,32 +12,73 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-this-in-production-please';
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
 // ── DB ────────────────────────────────────────────────────────────────────────
-const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway') || process.env.DATABASE_URL?.includes('postgres.railway')
+    ? { rejectUnauthorized: false }
+    : false,
+  // Connection pool settings for Railway
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+});
 
-async function initDB() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id SERIAL PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      encrypted_pat TEXT NOT NULL,
-      api_limit_threshold INTEGER DEFAULT 500,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS user_gists (
-      id SERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-      gist_id TEXT NOT NULL,
-      name TEXT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(user_id, gist_id)
-    );
-  `);
-  console.log('DB ready');
+async function initDB(retries = 10, delay = 3000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY,
+          username TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          encrypted_pat TEXT NOT NULL,
+          api_limit_threshold INTEGER DEFAULT 500,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS user_gists (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          gist_id TEXT NOT NULL,
+          name TEXT NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          UNIQUE(user_id, gist_id)
+        );
+      `);
+      console.log('DB ready');
+      return;
+    } catch (e) {
+      console.error(`DB init attempt ${i + 1}/${retries} failed:`, e.message);
+      if (i < retries - 1) {
+        console.log(`Retrying in ${delay / 1000}s...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw e;
+      }
+    }
+  }
 }
 
 // ── MIDDLEWARE ────────────────────────────────────────────────────────────────
-app.use(cors({ origin: CLIENT_URL, credentials: true }));
+// CORS: allow both with and without trailing slash, handle preflight properly
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (curl, Postman, Railway healthcheck)
+    if (!origin) return callback(null, true);
+    // Allow the configured client URL
+    const allowed = CLIENT_URL.replace(/\/$/, '');
+    if (origin === allowed || origin === allowed + '/') {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+// Handle preflight requests explicitly
+app.options('*', cors());
+
 app.use(express.json());
 
 function auth(req, res, next) {
@@ -48,10 +90,7 @@ function auth(req, res, next) {
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 }
 
-// ── CRYPTO HELPERS (server-side AES-256-GCM) ──────────────────────────────────
-// We use Node's built-in crypto for server operations
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
-
+// ── CRYPTO HELPERS ────────────────────────────────────────────────────────────
 function deriveKey(password, salt) {
   return scryptSync(password, salt, 32);
 }
@@ -78,15 +117,25 @@ function decrypt(data, password) {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
 }
 
+// ── HEALTH ────────────────────────────────────────────────────────────────────
+// Must respond BEFORE DB is ready so Railway doesn't kill the container during init
+app.get('/health', async (_, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true, db: 'connected' });
+  } catch {
+    // Return 200 even if DB isn't ready yet — let the app start
+    res.json({ ok: true, db: 'connecting' });
+  }
+});
+
 // ── AUTH ROUTES ───────────────────────────────────────────────────────────────
-// POST /api/auth/register
 app.post('/api/auth/register', async (req, res) => {
   const { username, password, pat } = req.body;
   if (!username || !password || !pat) return res.status(400).json({ error: 'username, password и PAT обязательны' });
   if (username.length < 3) return res.status(400).json({ error: 'Логин минимум 3 символа' });
   if (password.length < 6) return res.status(400).json({ error: 'Пароль минимум 6 символов' });
 
-  // Validate PAT against GitHub before saving
   const ghRes = await fetch('https://api.github.com/user', {
     headers: { Authorization: `Bearer ${pat}`, Accept: 'application/vnd.github+json' }
   });
@@ -94,7 +143,7 @@ app.post('/api/auth/register', async (req, res) => {
 
   try {
     const password_hash = await bcrypt.hash(password, 12);
-    const encrypted_pat = encrypt(pat, password); // PAT encrypted with user's password
+    const encrypted_pat = encrypt(pat, password);
     const result = await pool.query(
       'INSERT INTO users (username, password_hash, encrypted_pat) VALUES ($1, $2, $3) RETURNING id, username',
       [username.toLowerCase(), password_hash, encrypted_pat]
@@ -109,7 +158,6 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// POST /api/auth/login
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Логин и пароль обязательны' });
@@ -120,7 +168,6 @@ app.post('/api/auth/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password_hash);
     if (!ok) return res.status(401).json({ error: 'Неверный логин или пароль' });
     const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
-    // Decrypt PAT to return to client (stays in memory only)
     const pat = decrypt(user.encrypted_pat, password);
     res.json({ token, username: user.username, pat, threshold: user.api_limit_threshold });
   } catch (e) {
@@ -129,14 +176,12 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// GET /api/auth/me — refresh session + get PAT (requires re-auth for PAT)
 app.get('/api/auth/me', auth, async (req, res) => {
   const result = await pool.query('SELECT id, username, api_limit_threshold FROM users WHERE id = $1', [req.user.id]);
   res.json(result.rows[0] || {});
 });
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
-// PATCH /api/settings/threshold
 app.patch('/api/settings/threshold', auth, async (req, res) => {
   const { threshold } = req.body;
   if (!Number.isInteger(threshold) || threshold < 1 || threshold > 4999)
@@ -145,7 +190,6 @@ app.patch('/api/settings/threshold', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
-// PATCH /api/settings/password — change password (re-encrypts PAT)
 app.patch('/api/settings/password', auth, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   if (!oldPassword || !newPassword) return res.status(400).json({ error: 'Оба пароля обязательны' });
@@ -166,17 +210,12 @@ app.patch('/api/settings/password', auth, async (req, res) => {
   }
 });
 
-// ── GIST PROXY (encrypted) ────────────────────────────────────────────────────
-// All gist data is encrypted with user's password before storing in GitHub
-// Server never sees plaintext — encryption/decryption happens in browser via Web Crypto
-
-// GET /api/gists — list user's gists
+// ── GIST REGISTRY ─────────────────────────────────────────────────────────────
 app.get('/api/gists', auth, async (req, res) => {
   const result = await pool.query('SELECT gist_id, name, created_at FROM user_gists WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
   res.json(result.rows);
 });
 
-// POST /api/gists/register — register a gist as belonging to this user
 app.post('/api/gists/register', auth, async (req, res) => {
   const { gist_id, name } = req.body;
   if (!gist_id || !name) return res.status(400).json({ error: 'gist_id и name обязательны' });
@@ -188,23 +227,23 @@ app.post('/api/gists/register', auth, async (req, res) => {
   }
 });
 
-// DELETE /api/gists/:gistId — unregister gist
 app.delete('/api/gists/:gistId', auth, async (req, res) => {
   await pool.query('DELETE FROM user_gists WHERE user_id = $1 AND gist_id = $2', [req.user.id, req.params.gistId]);
   res.json({ ok: true });
 });
 
-// PATCH /api/gists/:gistId/name — update name
 app.patch('/api/gists/:gistId/name', auth, async (req, res) => {
   const { name } = req.body;
   await pool.query('UPDATE user_gists SET name = $1 WHERE user_id = $2 AND gist_id = $3', [name, req.user.id, req.params.gistId]);
   res.json({ ok: true });
 });
 
-// ── HEALTH ────────────────────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ ok: true }));
-
 // ── START ─────────────────────────────────────────────────────────────────────
-initDB().then(() => {
-  app.listen(PORT, () => console.log(`GistDB server on :${PORT}`));
-}).catch(e => { console.error('DB init failed:', e); process.exit(1); });
+// Start HTTP server immediately so Railway healthcheck passes,
+// then connect to DB in background with retries
+app.listen(PORT, () => console.log(`GistDB server on :${PORT}`));
+
+initDB().catch(e => {
+  console.error('DB init failed after all retries:', e);
+  process.exit(1);
+});
